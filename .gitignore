@@ -1,0 +1,83 @@
+# ─────────────────────────────────────────────────────────────
+# Python environment
+# ─────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+pip-wheel-metadata/
+
+# ─────────────────────────────────────────────────────────────
+# Python build artifacts
+# ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.eggs/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# `pip install -e pytorch-quantization` writes these in-tree
+pytorch-quantization/*.egg-info/
+pytorch-quantization/build/
+pytorch-quantization/dist/
+
+# ─────────────────────────────────────────────────────────────
+# NeuroSIM C++ build output
+# ─────────────────────────────────────────────────────────────
+*.o
+*.d
+NeuroSIM/.depend
+NeuroSIM/main
+
+# ─────────────────────────────────────────────────────────────
+# Simulation output
+#
+# The framework writes per-layer activation/weight traces and logs
+# into the working tree at run time. These are large, regenerated on
+# every run, and must not be committed.
+# ─────────────────────────────────────────────────────────────
+layer_record_*/
+log/
+results/
+
+# NeuroSIM scratch output. NOTE: NeuroSIM/tmp.txt and
+# "NeuroSIM/tmp copy.txt" are already tracked upstream, so these
+# patterns do not affect them — see report.md §1.4.
+NeuroSIM/tmp*.txt
+
+# ─────────────────────────────────────────────────────────────
+# Model weights and datasets
+#
+# Deliberately NOT ignoring *.csv — NetWork_*.csv and mem_states.csv
+# are source files that define the network mapping.
+# ─────────────────────────────────────────────────────────────
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+models/*.pth
+
+datasets/
+data/
+*cifar10-data/
+*cifar100-data/
+*imagenet/
+
+# HuggingFace / Torch Hub caches, if redirected into the tree
+.cache/
+hf_cache/
+torch_hub/
+
+# ─────────────────────────────────────────────────────────────
+# Editors and OS
+# ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,318 @@
+# Porting GPT-2 to DNN+NeuroSim — Work Report
+
+**Author:** Ali Sahebdad & mahdi Aghaei
+**Started:** 2026-08-11
+**Objective:** Port the GPT-2 language model into the DNN+NeuroSim 2D inference
+framework in order to estimate area, latency, energy, and accuracy for a
+compute-in-memory (CIM) accelerator running a decoder-only transformer.
+
+---
+
+## 1. Environment and Baseline
+
+### 1.1 Repository provenance
+
+
+| Item                    | Value                                                  |
+| ----------------------- | ------------------------------------------------------ |
+| Upstream repository     | `https://github.com/neurosim/NeuroSim`                 |
+| Upstream branch         | `2DInferenceV1.5-dev`                                  |
+| Personal fork           | `https://github.com/alisahebdad/NeuroSim`              |
+| Working branch          | `gpt2-port`                                            |
+| **Baseline commit**     | `9825ef40bf14d12a72c99d8e32ff8c499aeddf24`             |
+| Baseline commit subject | *Update validation data handling in `get_imagenet.sh`* |
+| Baseline commit author  | MING-YEN LEE                                           |
+| Baseline commit date    | 2026-07-18 16:44:26 +0800                              |
+| Local clone path        | `/Users/alisahebdad/Documents/Master/Memory/project`   |
+| Host platform           | macOS (Darwin 25.5.0), arm64                           |
+
+All work in this report is performed against the commit above. It is recorded in
+full so that every result reported later can be attributed to a known state of
+the upstream code, which continues to move independently.
+
+### 1.2 Setup performed
+
+The upstream repository was forked on GitHub (all branches, not `main` only),
+cloned locally, and the original repository added as a second remote named
+`upstream`:
+
+```bash
+git clone https://github.com/alisahebdad/NeuroSim.git
+git remote add upstream https://github.com/neurosim/NeuroSim.git
+git fetch upstream
+```
+
+Checking out the development branch initially failed:
+
+```
+fatal: '2DInferenceV1.5-dev' matched multiple (2) remote tracking branches
+```
+
+This is expected once two remotes carry the same branch name — Git declines to
+guess which one is intended. Resolved by naming the remote explicitly:
+
+```bash
+git checkout --track origin/2DInferenceV1.5-dev
+git config checkout.defaultRemote origin
+```
+
+The working branch was then created from the development branch and pushed:
+
+```bash
+git checkout -b gpt2-port
+git push -u origin gpt2-port
+```
+
+### 1.3 Resulting branch state
+
+```
+  2DInferenceV1.5-dev  9825ef4  [origin/2DInferenceV1.5-dev]
+* gpt2-port            9825ef4  [origin/gpt2-port]
+  main                 78cfe3e  [origin/main]
+```
+
+`git rev-list --count HEAD..upstream/2DInferenceV1.5-dev` returns **0**, i.e. the
+fork is level with upstream at the time of the fork; no upstream commits are
+missing.
+
+**Working convention adopted:** `2DInferenceV1.5-dev` is kept pristine and never
+committed to. It serves as the reference for unmodified upstream behaviour,
+which is needed continuously when diagnosing whether an anomaly originates in
+this work or in the original code. All modifications are made on `gpt2-port`
+or on branches taken from it.
+
+### 1.4 Repository hygiene
+
+The upstream repository ships without a `.gitignore`. One was added on
+`gpt2-port` covering the Python virtual environment (`.venv/`), Python and C++
+build artifacts, model checkpoints, datasets, and — most importantly — the
+simulation output the framework writes into the working tree at run time:
+
+- `layer_record_<model>/` — per-layer activation and weight traces, regenerated
+  on every run and consumed by the C++ estimator
+- `log/` — run logs, path derived from `--logdir` (`inference.py:28`)
+- `results/` — referenced at `inference.py:137`
+
+`*.csv` is deliberately **not** ignored: `NeuroSIM/NetWork_*.csv` and
+`mem_states.csv` are source files that define the network mapping and the
+memory-state model, and losing them to a broad rule would be silent and
+damaging.
+
+**Pre-existing tracked artifacts.** Four files that are build or scratch output
+are already tracked in the upstream repository:
+
+| Path | Nature |
+|---|---|
+| `NeuroSIM/main` | Compiled executable, rebuilt by `make` |
+| `NeuroSIM/.depend` | Generated dependency file |
+| `NeuroSIM/tmp.txt` | Scratch output |
+| `NeuroSIM/tmp copy.txt` | Scratch output |
+
+`.gitignore` does not apply to files already in the index, so these remain
+tracked and the corresponding rules are inert. This is confirmed by
+`git check-ignore` returning no match for `NeuroSIM/main` while matching every
+equivalent untracked path.
+
+The practical consequence is that **running `make` will make `git status` show
+`NeuroSIM/main` as modified on every build**, with a binary diff. Two remedies
+exist, and the choice is deliberate:
+
+- `git rm --cached NeuroSIM/main NeuroSIM/.depend` — clean, but diverges from
+  upstream and risks a modify/delete conflict if upstream ever re-commits them.
+- `git update-index --skip-worktree <path>` — no divergence, but the flag is
+  local-only, invisible in `git status`, and can obstruct later pulls.
+
+Whichever is chosen, the risk to guard against is committing a rebuilt binary
+by reflex with `git add -A`.
+
+---
+
+## 2. Structure of the Baseline Framework
+
+DNN+NeuroSim is two programs joined by a narrow text interface, and it is
+important to treat them separately.
+
+**Python side (repository root).** A PyTorch model whose Conv/Linear layers are
+substituted with CIM-aware quantized equivalents. It performs *functional*
+simulation — quantization, bit-slicing, ADC effects — and emits per-layer
+activation and weight traces for the hardware estimator.
+
+
+| File                    | Role                                                                            |
+| ----------------------- | ------------------------------------------------------------------------------- |
+| `inference.py`          | Entry point; argument parsing; invokes the C++ estimator                        |
+| `quantize.py`           | Model construction, calibration, quantization, evaluation                       |
+| `dataset.py`            | CIFAR-10 / CIFAR-100 / ImageNet loaders                                         |
+| `models/`               | `vgg.py`, `resnet.py` (locally defined networks only)                           |
+| `pytorch-quantization/` | Vendored NVIDIA TensorRT quantization toolkit, extended with a`cim/` subpackage |
+
+**C++ side (`NeuroSIM/`).** A hardware estimator (~98 source files) that reads a
+network-shape CSV plus the Python traces and produces area, latency, and energy
+figures. Key files: `Chip.cpp` (floorplanning), `ProcessingUnit.cpp`,
+`SubArray.cpp`, `Param.cpp` (all technology and architecture knobs),
+`main.cpp`.
+
+**The interface between them** is `NeuroSIM/NetWork_<model>.csv`. Each row
+describes one mapped layer with eight fields:
+
+```
+IFM_row, IFM_col, IFM_channel, Kernel_row, Kernel_col, Out_channel, followed_by_pool, speedup
+```
+
+This vocabulary is convolution-shaped, and everything downstream assumes it. A
+fully-connected layer is expressed as a `1×1` kernel. **Most of the porting
+effort will be spent on what this format can and cannot express**, not on the
+PyTorch model itself.
+
+Reference documentation is included at
+`Documents/User Manual of DNN simulator_V1.5.pdf`.
+
+---
+
+## 3. Key Finding: Partial Transformer Support Already Exists
+
+This branch is **not** transformer-naive, which contradicts the assumption I
+started from (based on older NeuroSim V1.x). Three pieces of evidence:
+
+1. `quantize.py:101` constructs `torchvision.models.swin_v2_t` when
+   `--model swin_t` is passed; `inference.py:18` advertises it as a supported
+   model.
+2. `NeuroSIM/NetWork_swin_t.csv` exists — a 53-row mapping for Swin
+   Transformer V2 Tiny.
+3. `pytorch-quantization/pytorch_quantization/cim/modules/cim_linear.py:125`
+   contains an explicit branch for rank-3 inputs, commented
+   `# for swin transformer`.
+
+This is significant: **the hardest part of the port — proving a transformer can
+traverse the pipeline at all — has partial precedent in the codebase.** It
+should be studied before writing anything new.
+
+### 3.1 What the Swin mapping actually covers
+
+Tabulating every distinct row in `NetWork_swin_t.csv` against the known
+Swin-V2-T configuration (depths `[2,2,6,2]`, embedding dims `[96,192,384,768]`,
+heads `[3,6,12,24]`):
+
+
+| Row pattern                                           | Count   | Identified as                                         |
+| ----------------------------------------------------- | ------- | ----------------------------------------------------- |
+| `224,224,3,4,4,96,0,4`                                | 1       | Patch-embedding convolution                           |
+| `15,15,2,1,1,512,...`                                 | 12      | Continuous position-bias MLP, layer 1 (one per block) |
+| `15,15,512,1,1,{3,6,12,24},...`                       | 2/2/6/2 | Position-bias MLP layer 2 (→ heads per stage)        |
+| `{56,28,14,7},...,dim→4·dim`                        | 2/2/6/2 | Feed-forward`fc1`                                     |
+| `{56,28,14,7},...,4·dim→dim`                        | 2/2/6/2 | Feed-forward`fc2`                                     |
+| `28,28,384→192` / `14,14,768→384` / `7,7,1536→768` | 1 each  | Patch-merging reductions                              |
+| `1,1,768,1,1,1000,0,1`                                | 1       | Classification head                                   |
+
+The counts match the architecture exactly, so this accounting is complete —
+every one of the 53 rows is assigned.
+
+**What is therefore absent:** the QKV projections, the attention output
+projections, and both attention matrix products (`QKᵀ` and `softmax(·)V`). No
+row anywhere corresponds to a `dim → 3·dim` or `dim → dim` attention
+projection.
+
+### 3.2 Consequence for this project
+
+The existing support maps the feed-forward, patch, and position-bias paths to
+CIM, but **the attention mechanism itself is not mapped**. The hardware numbers
+produced for `swin_t` therefore describe a partial network.
+
+This is precisely the gap a GPT-2 port must confront, and it is the natural
+locus of an original contribution. It also splits cleanly into two distinct
+sub-problems that should not be conflated:
+
+- **Static-weight attention layers** (QKV and output projections). These are
+  ordinary `nn.Linear` layers with fixed weights; there is no architectural
+  reason they cannot be mapped. Their absence looks like an *implementation*
+  limitation, and determining the cause is a concrete first investigation.
+- **Dynamic matmuls** (`QKᵀ`, `softmax(·)V`). These multiply activation by
+  activation with no static operand, so there is nothing to program into a
+  crossbar. Their absence is a *fundamental* limitation of the CIM model, and
+  addressing it requires an explicit architectural decision (digital offload,
+  or per-token array writes).
+
+> **Status: preliminary.** The tabulation above is derived from row counting and
+> architecture knowledge, not yet from tracing execution. The claim to verify
+> first is *why* the projections are absent — deliberate exclusion, a limitation
+> of the layer-replacement pass, or an artifact of how the CSV was generated.
+
+### 3.3 Configuration note
+
+`NeuroSIM/Param.cpp:99` carries the comment:
+
+```cpp
+novelMapping = true;   // false: conventional mapping (change to false for swin_t)
+```
+
+The transformer path requires conventional mapping. This is a manual edit, not
+a command-line flag, and is an easy source of silent misconfiguration.
+
+---
+
+## 4. Revised Plan
+
+Section 3 changes the sequencing: **Swin becomes the reference implementation**
+rather than GPT-2 being built from nothing.
+
+
+| Phase | Goal                      | Exit criterion                                                                           |
+| ----- | ------------------------- | ---------------------------------------------------------------------------------------- |
+| 0     | Reproduce a baseline      | `--model vgg8` runs end to end; console output archived                                  |
+| 1     | Reproduce Swin            | `--model swin_t` runs end to end with `novelMapping = false`                             |
+| 2     | Trace one FC layer        | Full path documented: PyTorch module → CIM module → trace files → CSV row → C++ tile |
+| 3     | Explain §3.2             | Determine why QKV/proj are unmapped; attempt to add them to the Swin path                |
+| 4     | Choose attention strategy | Written decision on`QKᵀ`/`PV`: digital offload vs. dynamic write vs. excluded           |
+| 5     | Minimal GPT-2 block       | One decoder block traverses the pipeline                                                 |
+| 6     | Quantization              | Per-channel weights; handle LayerNorm/GELU activation outliers; measure accuracy cliff   |
+| 7     | Full GPT-2 small (124M)   | Perplexity on WikiText-2 vs. FP32 baseline                                               |
+| 8     | Design-space exploration  | Sweep ADC precision, cells/weight, tile size, technology node                            |
+
+Phases 1–3 are the highest-value work and were not visible in the original
+plan. Phase 3 in particular may convert a large part of the intended
+contribution into an extension of existing code rather than new code — which is
+a better outcome, provided it is documented as such.
+
+### 4.1 Differences from GPT-2 that Swin will not answer
+
+Swin is bidirectional, fixed-resolution, and encoder-only. Even a complete Swin
+mapping leaves the following unaddressed, and they must be treated as GPT-2
+specific work:
+
+- **Causal masking** — no analogue in Swin's windowed attention.
+- **Autoregressive decoding and the KV cache** — NeuroSim models a single static
+  inference pass. Per-token decode has no representation in the CSV format.
+- **Variable sequence length** — Swin's spatial dimensions are fixed at compile
+  time; GPT-2's are not.
+- **Weight tying** — GPT-2's embedding and output projection share weights, which
+  interacts with how layers are counted and mapped.
+
+A defensible narrowing of scope is to simulate **prefill only** at a fixed
+sequence length, and to state the exclusion of autoregressive decode explicitly
+rather than leave it implicit.
+
+---
+
+## 5. Open Questions
+
+1. Why are the QKV and attention-output projections absent from
+   `NetWork_swin_t.csv`? (Blocks Phase 3.)
+2. Is `NetWork_*.csv` generated programmatically or written by hand? This
+   determines whether GPT-2's 12 blocks can be emitted automatically.
+3. How does `cim_linear.py` handle rank-3 `(batch, tokens, features)` input —
+   are tokens folded into the batch dimension, and what does that imply for the
+   `speedup` column?
+4. What does the `speedup` column control in the C++ estimator, and what is the
+   correct value for a token-sequence layer?
+5. Can the ImageNet-dependent evaluation path be bypassed? GPT-2 needs a text
+   corpus, and `dataset.py` currently offers only image datasets.
+
+---
+
+## 6. Log
+
+
+| Date       | Entry                                                                                                                                                                                                                                                                    |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 2026-08-11 | Forked upstream, created`gpt2-port` at `9825ef4`, added `upstream` remote. Surveyed repository structure. Identified existing partial Swin Transformer support and determined that attention projections and matmuls are unmapped (§3). Revised phase plan accordingly. |
+| 2026-08-11 | Added `.gitignore` (§1.4), covering `.venv/`, build artifacts, checkpoints, datasets, and simulation output. Documented four pre-existing tracked build artifacts that ignore rules cannot affect.                                                                        |
