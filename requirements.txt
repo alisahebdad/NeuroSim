@@ -1,0 +1,72 @@
+# DNN+NeuroSim V1.5 — pip requirements
+# Converted from the upstream conda `environment.yml` (see report.md §1.5).
+#
+# Target: Python 3.11 (upstream pinned python=3.11.5)
+#
+#   python3.11 -m venv .venv
+#   source .venv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#   pip install -e pytorch-quantization      # REQUIRES nvcc — see note below
+#
+# Only DIRECT dependencies are listed. The conda file enumerated ~200 packages,
+# but most were transitive or OS-level (libgcc, ffmpeg, qt, mysql, glib);
+# pip resolves transitive deps on its own.
+#
+# ── HARD REQUIREMENT: NVIDIA GPU + CUDA toolkit ──────────────────────────────
+# `pytorch-quantization/setup.py` builds a CUDAExtension from
+# `src/tensor_quant_gpu.cu`, and `tensor_quant.py:28` imports it unconditionally
+# (`from pytorch_quantization import cuda_ext`) with no CPU fallback. The
+# package cannot be built or even imported without CUDA. This is not a
+# convenience dependency. See report.md §1.6.
+#
+# torch 2.1.1 from PyPI ships CUDA 12.1 on linux-x86_64, matching the conda
+# pin (pytorch=2.1.1=py3.11_cuda12.1_cudnn8.9.2_0). For a different CUDA
+# version, install torch first from https://download.pytorch.org/whl/<cuXXX>.
+
+# ── Core: PyTorch ────────────────────────────────────────────────────────────
+torch==2.1.1
+torchvision==0.16.1
+
+# ── Core: required by pytorch-quantization ───────────────────────────────────
+# (mirrors pytorch-quantization/requirements.txt, with versions pinned to the
+#  conda environment where it specified them)
+numpy==1.26.2
+scipy==1.11.4
+absl-py==2.0.0
+prettytable==3.9.0
+pyyaml==6.0.1
+sphinx_glpi_theme==0.4.1
+
+# ── Core: imported by inference.py / quantize.py / dataset.py ────────────────
+tqdm==4.66.1
+pillow==10.0.1
+requests==2.31.0
+
+# ── GPT-2 port: imported by GPT2_Model.py ────────────────────────────────────
+# tiktoken was NOT in the upstream conda environment — it is a new dependency
+# introduced by this project's GPT-2 work.
+tiktoken==0.5.2
+transformers==4.35.2
+tokenizers==0.15.0
+huggingface-hub==0.19.4
+safetensors==0.4.1
+
+# ── Datasets and evaluation (needed for WikiText-2 perplexity, Phase 7) ──────
+datasets==2.15.0
+accelerate==0.24.1
+sentencepiece==0.1.99
+
+# ── Analysis and plotting (design-space exploration, Phase 8) ────────────────
+matplotlib==3.8.0
+pandas==2.1.3
+seaborn==0.12.2
+scikit-learn==1.3.2
+
+# ── Optional: present upstream, not required to run inference ────────────────
+# Uncomment if needed.
+# timm==1.0.7              # alternative model zoo
+# wandb==0.18.7            # experiment tracking
+# optuna==4.1.0            # hyperparameter search
+# onnxruntime              # pytorch-quantization/examples only
+# pytest==7.4.4            # pytorch-quantization/tests only

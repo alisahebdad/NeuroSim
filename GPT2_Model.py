@@ -14,7 +14,6 @@ elif torch.backends.mps.is_available():
     device = torch.device("mps")
 else:
     device = torch.device("cpu")
-
 print(f"Using device: {device}")
 
 
@@ -28,6 +27,15 @@ class Config:
     n_embd = 768
     vocab_size = 50257
     block_size = 1024
+
+    def __init__(self, **kwargs):
+        # Allow overrides, e.g. Config(block_size=128) for CIM simulation.
+        # Shorter sequences make the un-mappable attention matmuls a smaller
+        # fraction of total compute, and keep simulate_array() tractable.
+        for k, v in kwargs.items():
+            if not hasattr(Config, k):
+                raise AttributeError(f"unknown config field: {k}")
+            setattr(self, k, v)
 
 
 # ============================================================
@@ -71,6 +79,10 @@ class CausalSelfAttention(nn.Module):
 
         B, T, C = x.size()
 
+        # MAPPED TO CIM. self.c_attn is monkey-patched to CIMLinear by
+        # quant_modules.initialize(), so calling it as a module runs the
+        # crossbar simulation, emits a NetWork_gpt2.csv row, and dumps
+        # input_*/weight_* traces on the first forward.
         q, k, v = self.c_attn(x).split(
             self.n_embd,
             dim=2
@@ -90,23 +102,52 @@ class CausalSelfAttention(nn.Module):
             B, T, self.n_head, head_dim
         ).transpose(1, 2)
 
+        # ------------------------------------------------------------------
+        # TODO(neurosim-c++): QK^T is NOT mapped to CIM and never will be by
+        # the current framework. Both operands are activations, so there is no
+        # static weight to program into a crossbar. Because this is a bare
+        # tensor op (not an nn.Module), CIMLinear's forward override never
+        # sees it: no NetWork_gpt2.csv row, no trace file, no quantization.
+        #
+        # The C++ estimator therefore reports NOTHING for this operation. To
+        # account for it, one of:
+        #   (a) digital offload  - add an analytical area/latency/energy model
+        #                          for a digital MAC unit of T*T*head_dim MACs
+        #                          per head, and report it alongside NeuroSim's
+        #                          numbers;
+        #   (b) dynamic CIM      - write K into the array every token and model
+        #                          the write cost (expensive for RRAM);
+        #   (c) exclude          - state the exclusion explicitly in results.
+        # See report.md 3.2. Cost share: ~2.7% of MACs at T=128, ~18% at T=1024.
+        # ------------------------------------------------------------------
         att = (
             q @ k.transpose(-2, -1)
         ) * (1.0 / math.sqrt(head_dim))
 
+        # TODO(neurosim-c++): causal masking has no analogue in NeuroSim. Swin
+        # (the only transformer upstream supports) uses bidirectional windowed
+        # attention. Masking is free here in software but would need a
+        # peripheral model on real hardware.
         att = att.masked_fill(
             self.mask[:, :, :T, :T] == 0,
             float("-inf")
         )
 
+        # TODO(neurosim-c++): softmax is not modelled. NeuroSim's peripheral
+        # circuit library covers ReLU and pooling only (see NeuroSIM/*.cpp:
+        # no Softmax/Exp unit exists). Its exp() and division are non-trivial
+        # in hardware and are currently unaccounted for in area and energy.
         att = F.softmax(att, dim=-1)
 
+        # TODO(neurosim-c++): softmax(.)V - same situation as QK^T above.
+        # Activation x activation, invisible to the CIM path.
         y = (
             att @ v
         ).transpose(1, 2).contiguous().view(
             B, T, C
         )
 
+        # MAPPED TO CIM.
         return self.c_proj(y)
 
 
@@ -131,6 +172,16 @@ class MLP(nn.Module):
 
     def forward(self, x):
 
+        # Both c_fc and c_proj are MAPPED TO CIM.
+        #
+        # TODO(neurosim-c++): F.gelu is not modelled. NeuroSim assumes ReLU in
+        # its peripheral path. GELU is materially more expensive (erf/tanh
+        # approximation) and its area/energy are unaccounted for.
+        #
+        # NOTE (quantization): GELU output feeds c_proj, and its distribution
+        # has heavy outliers. This is the layer most likely to break the
+        # per-tensor activation quantizer. If accuracy collapses, inspect the
+        # amax of mlp.c_proj's input quantizer first. See report.md phase 6.
         return self.c_proj(
             F.gelu(
                 self.c_fc(x)
@@ -155,6 +206,14 @@ class Block(nn.Module):
 
     def forward(self, x):
 
+        # TODO(neurosim-c++): nn.LayerNorm is not intercepted (only Conv2d,
+        # Linear and the pooling layers are in cim_quant_map) and has no C++
+        # model. Two LayerNorms per block x 12 blocks + ln_f = 25 unaccounted
+        # normalisation units, each requiring mean/variance over 768 elements.
+        #
+        # TODO(neurosim-c++): the residual adds are also unmodelled. They are
+        # cheap, but they imply buffer traffic the C++ floorplanner does not
+        # see because no NetWork_gpt2.csv row describes them.
         x = x + self.attn(
             self.ln_1(x)
         )
@@ -203,6 +262,14 @@ class GPT2(nn.Module):
         )
 
         # Weight tying
+        #
+        # TODO(neurosim-c++): lm_head and wte share one weight tensor. A CIM
+        # chip cannot share a physical crossbar between two layers, so on real
+        # hardware this costs either a second 50257x768 array (~38.6M cells,
+        # larger than all 12 blocks combined) or a dedicated digital path.
+        # NeuroSim has no way to express sharing: if lm_head gets a
+        # NetWork_gpt2.csv row, its area is counted as if it were separate.
+        # Decide and document: counted separately, or excluded.
         self.lm_head.weight = self.transformer.wte.weight
 
     def forward(self, idx):
@@ -216,6 +283,12 @@ class GPT2(nn.Module):
             device=idx.device
         )
 
+        # TODO(neurosim-c++): nn.Embedding is a table lookup, not a matmul, so
+        # it is neither intercepted nor expressible as a NetWork_gpt2.csv row
+        # (the format describes MAC layers). wte holds 38.6M parameters and
+        # wpe 0.79M - together ~32% of GPT-2's 124M. Their storage cost is
+        # real but invisible to the estimator. Model them as on-chip memory
+        # separately, or state the exclusion.
         x = (
             self.transformer.wte(idx)
             +
@@ -347,7 +420,7 @@ if __name__ == "__main__":
 
     prompt = "The meaning of life is"
 
-    for i in range(10):
+    for i in range(100):
 
         # Encode prompt
         ids = torch.tensor(

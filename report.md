@@ -125,6 +125,80 @@ exist, and the choice is deliberate:
 Whichever is chosen, the risk to guard against is committing a rebuilt binary
 by reflex with `git add -A`.
 
+### 1.5 Conversion of the conda environment to pip
+
+Upstream ships `environment.yml`, a conda specification pinned to exact
+linux-64 build strings (e.g. `brotli-python=1.0.9=py311h6a678d5_7`) and CUDA
+12.1. It cannot be solved on any other platform, and conda is not in use in
+this project. It was therefore converted to a pip `requirements.txt` for a
+`.venv` virtual environment.
+
+**Method.** The conda file enumerates ~200 packages, but the large majority are
+transitive or OS-level dependencies that conda must name explicitly and pip
+does not (`libgcc`, `ffmpeg`, `qt-main`, `mysql`, `glib`, `mkl`, …). Rather
+than transcribe the list, the *direct* dependencies were derived from the
+source: every non-standard-library import across the repository root,
+`models/`, and `pytorch_quantization/` was collected and matched against the
+version pins in `environment.yml`.
+
+| Category | Packages |
+|---|---|
+| PyTorch | `torch==2.1.1`, `torchvision==0.16.1` |
+| Required by `pytorch-quantization` | `numpy`, `scipy`, `absl-py`, `prettytable`, `pyyaml`, `sphinx_glpi_theme` |
+| Imported by the framework entry points | `tqdm`, `pillow`, `requests` |
+| GPT-2 work | `tiktoken`, `transformers`, `tokenizers`, `huggingface-hub`, `safetensors` |
+| Dataset / evaluation | `datasets`, `accelerate`, `sentencepiece` |
+| Analysis | `matplotlib`, `pandas`, `seaborn`, `scikit-learn` |
+| Optional (commented) | `timm`, `wandb`, `optuna`, `onnxruntime`, `pytest` |
+
+Versions are pinned to the conda environment wherever it specified them, so the
+pip environment reproduces the upstream software stack rather than merely
+resembling it.
+
+**One dependency is new.** `tiktoken` is imported by `GPT2_Model.py` but does
+not appear anywhere in `environment.yml`. It is a dependency introduced by this
+project, not inherited, and is annotated as such in `requirements.txt`.
+
+The conda `pytorch=2.1.1=py3.11_cuda12.1_cudnn8.9.2_0` pin is matched by the
+default PyPI `torch==2.1.1` wheel on linux-x86_64, which also ships CUDA 12.1;
+no custom index URL is required for this configuration.
+
+Setup:
+
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip && pip install -r requirements.txt
+pip install -e pytorch-quantization
+```
+
+`environment.yml` is retained unmodified for provenance.
+
+### 1.6 CUDA is a hard requirement
+
+Investigation during §1.5 established that an NVIDIA GPU with the CUDA toolkit
+is **mandatory**, not merely the fast path:
+
+1. `pytorch-quantization/setup.py:64-69` declares a `CUDAExtension` built from
+   `src/tensor_quant_gpu.cu`. `pip install -e pytorch-quantization` therefore
+   requires `nvcc` and will fail without it.
+2. `pytorch_quantization/tensor_quant.py:28` executes
+   `from pytorch_quantization import cuda_ext` as an unconditional top-level
+   import. There is no `try`/`except` and no CPU fallback, so the package
+   cannot be imported at all without the compiled extension.
+3. Independently, the framework hard-codes device placement:
+   `quantize.py:127` (`model.to("cuda")`), `:191`, `:257`, `:300`, and
+   `inference.py:88-89` (`torch.cuda.set_device`).
+
+Item 3 alone could be patched with a `--device` argument. Items 1 and 2 could
+not — the quantization core is compiled CUDA C++, and reimplementing it on CPU
+is out of scope. **The framework cannot be run on the macOS development
+machine.** All simulation work must be performed on a Linux host with an
+NVIDIA GPU.
+
+This is recorded because it constrains the project schedule: code may be
+written and reviewed locally, but no result in this report can be produced
+without access to such a machine.
+
 ---
 
 ## 2. Structure of the Baseline Framework
@@ -309,10 +383,78 @@ rather than leave it implicit.
 
 ---
 
-## 6. Log
+## 6. Python-Side GPT-2 Port
+
+The accuracy half of the framework was ported for GPT-2 small (124M). The C++
+estimator is deliberately out of scope; every point at which data would cross
+to it is marked `TODO(neurosim-c++)` in the source (14 markers total).
+
+### 6.1 Files
+
+| File | Status | Role |
+|---|---|---|
+| `GPT2_Model.py` | modified | Model definition; `Config` accepts overrides; TODO markers at each un-mappable operation |
+| `dataset_gpt2.py` | new | WikiText-2 loader yielding `(input_ids, targets)`, shaped so upstream `collect_stats()` works unmodified |
+| `inference_gpt2.py` | new | Harness: argument parsing, network-description generation, calibration, three-stage evaluation |
+
+### 6.2 What is mapped
+
+The model calls its projections as modules (`self.c_attn(x)`), so
+`quant_modules.initialize()` intercepts all of them: 4 layers per block × 12
+blocks = **48 mapped layers, 85M of GPT-2's 124M parameters**. `lm_head` is
+excluded by default (weight-tied to `wte`, and 768→50257 needs 3141 subarrays
+at 8-bit).
+
+Unmapped, and marked in the source: `QKᵀ` and `softmax(·)V` (activation ×
+activation), LayerNorm, GELU, softmax, and the `wte`/`wpe` embeddings.
+
+### 6.3 Defect found in the Swin rank-3 path
+
+`cim_linear.py:125` emits a `NetWork` row from `input.shape[1], input.shape[2]`
+when input rank exceeds 2. Swin's Linear input is rank-4 `(B, H, W, C)`, so
+those fields correctly give the token grid. **GPT-2's input is rank-3
+`(B, T, C)`**, so the same code writes `IFM_row=T, IFM_col=768` — describing
+`T × 768` tokens instead of `T`, a 768× overstatement of the mapped workload.
+
+The port therefore suppresses the automatic emission (`write_network = False`)
+and generates `NeuroSIM/NetWork_gpt2.csv` explicitly in
+`inference_gpt2.write_network_csv()`, using `(IFM_row, IFM_col) = (T, 1)`.
+
+### 6.4 Sequence length as a scoping lever
+
+The un-mappable attention work scales as `T²` while the mapped work scales as
+`T`, so the share of GPT-2 that CIM cannot cover depends entirely on sequence
+length:
+
+| T | Static MACs | Dynamic MACs | Dynamic share |
+|---|---|---|---|
+| 128 | 0.91 G | 0.025 G | 2.7 % |
+| 512 | 3.6 G | 0.40 G | 10 % |
+| 1024 | 7.25 G | 1.61 G | 18 % |
+
+`--block_size` defaults to 128 on this basis: at that length, digital offload
+of attention leaves 97% of compute on CIM, which makes the exclusion
+defensible rather than evasive.
+
+### 6.5 Reporting constraint
+
+Accuracy covers the **whole** network; the hardware numbers the C++ side would
+eventually report cover only the 48 mapped projections. These two figures
+describe different objects and must never be presented as one result.
+
+> **Status: written, not executed.** No CUDA machine was available (§1.6). The
+> files parse, and the interfaces were checked against the upstream call
+> signatures, but no numbers have been produced and no claim here is
+> empirically verified.
+
+---
+
+## 7. Log
 
 
 | Date       | Entry                                                                                                                                                                                                                                                                    |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 2026-08-11 | Forked upstream, created`gpt2-port` at `9825ef4`, added `upstream` remote. Surveyed repository structure. Identified existing partial Swin Transformer support and determined that attention projections and matmuls are unmapped (§3). Revised phase plan accordingly. |
 | 2026-08-11 | Added `.gitignore` (§1.4), covering `.venv/`, build artifacts, checkpoints, datasets, and simulation output. Documented four pre-existing tracked build artifacts that ignore rules cannot affect.                                                                        |
+| 2026-08-11 | Converted `environment.yml` to `requirements.txt` for a `.venv` virtual environment (§1.5). Established that CUDA is a hard requirement of `pytorch-quantization`, not merely the fast path, and that the framework cannot run on macOS (§1.6).                            |
+| 2026-08-11 | Ported the Python side of GPT-2 (§6): `dataset_gpt2.py`, `inference_gpt2.py`, TODO markers in `GPT2_Model.py`. Found and worked around a rank-3 geometry defect in `cim_linear.py:125` (§6.3). Not yet executed — no CUDA machine.                                          |
