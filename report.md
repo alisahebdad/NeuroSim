@@ -151,9 +151,26 @@ version pins in `environment.yml`.
 | Analysis | `matplotlib`, `pandas`, `seaborn`, `scikit-learn` |
 | Optional (commented) | `timm`, `wandb`, `optuna`, `onnxruntime`, `pytest` |
 
-Versions are pinned to the conda environment wherever it specified them, so the
-pip environment reproduces the upstream software stack rather than merely
-resembling it.
+**Revision (same day): pins relaxed to floors.** The first version of
+`requirements.txt` pinned every package to the conda-specified version. That
+proved uninstallable: both development machines run **Python 3.14**, and
+`torch==2.1.1` publishes no wheels beyond Python 3.11, so `pip install -r`
+fails with *"no matching distribution found"* before installing anything.
+
+The file now specifies floors. The trade-off is stated explicitly in its
+header: results are **not bit-comparable** to published NeuroSim numbers
+produced on the original stack. Reproducibility is instead obtained from a
+lockfile (`pip freeze > requirements-lock.txt`) captured after a successful
+run, which is committed. A lockfile of a stack that works is worth more than a
+pin of one that cannot be installed.
+
+Reproducing upstream exactly remains possible by installing Python 3.11 and
+restoring the pins named in `environment.yml`; the header documents how.
+
+**Dependency conflict encountered.** `huggingface_hub` 1.0 removed `HfFolder`,
+which `datasets` < 3.0 imports at module load, producing
+`ImportError: cannot import name 'HfFolder'`. The two must be kept on the same
+side of that boundary; the requirements floor both.
 
 **One dependency is new.** `tiktoken` is imported by `GPT2_Model.py` but does
 not appear anywhere in `environment.yml`. It is a dependency introduced by this
@@ -198,6 +215,12 @@ NVIDIA GPU.
 This is recorded because it constrains the project schedule: code may be
 written and reviewed locally, but no result in this report can be produced
 without access to such a machine.
+
+**Confirmed on the Linux host (2026-08-12).** A traceback from
+`inference_gpt2.py` reached the data-loading stage, which is past all
+module-level `pytorch_quantization` imports. The CUDA extension therefore
+compiles and imports successfully under Python 3.14 with a modern PyTorch —
+the outcome that was least certain when the pins were relaxed (§1.5).
 
 ---
 
@@ -458,3 +481,4 @@ describe different objects and must never be presented as one result.
 | 2026-08-11 | Added `.gitignore` (§1.4), covering `.venv/`, build artifacts, checkpoints, datasets, and simulation output. Documented four pre-existing tracked build artifacts that ignore rules cannot affect.                                                                        |
 | 2026-08-11 | Converted `environment.yml` to `requirements.txt` for a `.venv` virtual environment (§1.5). Established that CUDA is a hard requirement of `pytorch-quantization`, not merely the fast path, and that the framework cannot run on macOS (§1.6).                            |
 | 2026-08-11 | Ported the Python side of GPT-2 (§6): `dataset_gpt2.py`, `inference_gpt2.py`, TODO markers in `GPT2_Model.py`. Found and worked around a rank-3 geometry defect in `cim_linear.py:125` (§6.3). Not yet executed — no CUDA machine.                                          |
+| 2026-08-12 | Relaxed `requirements.txt` pins to floors after the pinned stack proved uninstallable on Python 3.14 (§1.5). Resolved a `datasets` / `huggingface_hub` `HfFolder` conflict. Confirmed the `pytorch_quantization` CUDA extension builds under Python 3.14 on the Linux host (§1.6).                |
