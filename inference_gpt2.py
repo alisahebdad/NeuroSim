@@ -26,6 +26,7 @@ Usage:
 
 import os
 import ast
+import math
 import time
 import argparse
 from datetime import datetime
@@ -122,6 +123,25 @@ def parse_args():
     p.add_argument('--adc_quant_method', type=str, default='scale')
     p.add_argument('--optimize_adc', type=int, default=0)
     p.add_argument('--adc_enable', type=int, default=1)
+
+    # ── amax selection: the fix for the INT8 collapse ────────────────────
+    p.add_argument('--amax_method', type=str, default='percentile',
+                   help="how HistogramCalibrator picks amax: percentile | "
+                        "entropy | mse. Ignored when --input_calib_method is "
+                        "'max', because MaxCalibrator takes the absolute "
+                        "maximum and has nothing to choose.")
+    p.add_argument('--percentile', type=float, default=99.99,
+                   help="percentile for --amax_method percentile. The value "
+                        "previously hardcoded (99.9999) is effectively the "
+                        "maximum: over ~1.5M calibration values it discards "
+                        "about one, so a single outlier still sets the scale.")
+
+    # ── diagnostics ──────────────────────────────────────────────────────
+    p.add_argument('--quant_ablation', type=int, default=1,
+                   help='evaluate weight-only and input-only INT8 separately '
+                        'so the collapse can be attributed to one of them')
+    p.add_argument('--outlier_report', type=int, default=1,
+                   help='print per-layer activation max vs 99.9th percentile')
 
     args = p.parse_args()
     args.sub_array = ast.literal_eval(args.sub_array)
@@ -253,6 +273,96 @@ def build_model(args):
     model = load_gpt2()
     model.config = cfg
     return model, cfg
+
+
+def set_quantizers(model, layer_quant, inputs=None, weights=None, adc=None):
+    """Enable/disable quantizer families independently.
+
+    Layers outside `layer_quant` are always left disabled. Passing None for a
+    family leaves it untouched, so one call can flip only what it names.
+    """
+    for name, m in model.named_modules():
+        if not isinstance(m, quant_nn.TensorQuantizer):
+            continue
+
+        layer = name.rsplit('.', 1)[0]
+        if layer not in layer_quant:
+            m.disable()
+            continue
+
+        if name.endswith('_input_quantizer') and inputs is not None:
+            m.enable() if inputs else m.disable()
+        elif name.endswith('_weight_quantizer') and weights is not None:
+            m.enable() if weights else m.disable()
+        elif name.endswith('_adc_quantizer') and adc is not None:
+            m.enable() if adc else m.disable()
+
+
+@torch.no_grad()
+def report_activation_outliers(model, loader, device, layer_quant, top_n=10):
+    """Per-layer activation max vs 99.9th percentile, on one FP batch.
+
+    A per-tensor INT8 scale is set by the maximum. When the maximum is far
+    above the bulk of the distribution, almost the entire 8-bit code space is
+    spent covering a handful of values and ordinary activations collapse into
+    a few codes. The ratio printed here is exactly that waste factor: a ratio
+    of R means typical values effectively get 8 - log2(R) bits.
+
+    Call this with quantizers DISABLED, so it measures the true FP
+    distribution rather than an already-quantized one.
+    """
+    stats = {}
+    handles = []
+
+    def make_hook(name):
+        def hook(module, inp, out):
+            if name in stats:            # first forward only
+                return
+            x = inp[0].detach().flatten().abs().float()
+            if x.numel() > 1_000_000:    # torch.quantile has a size limit
+                idx = torch.randint(0, x.numel(), (1_000_000,),
+                                    device=x.device)
+                x = x[idx]
+            stats[name] = (x.max().item(),
+                           torch.quantile(x, 0.999).item())
+        return hook
+
+    for name, m in model.named_modules():
+        if isinstance(m, macro.CIM) and name in layer_quant:
+            handles.append(m.register_forward_hook(make_hook(name)))
+
+    x, _ = next(iter(loader))
+    model(x.to(device))
+
+    for h in handles:
+        h.remove()
+
+    ranked = sorted(stats.items(), key=lambda kv: kv[1][0] / max(kv[1][1], 1e-9),
+                    reverse=True)
+
+    print("\n" + "=" * 78)
+    print("ACTIVATION OUTLIERS  (input to each mapped layer, FP32)")
+    print("=" * 78)
+    print(f"{'layer':<38}{'max':>11}{'p99.9':>11}{'ratio':>9}{'eff.bits':>9}")
+    print("-" * 78)
+    for name, (mx, p999) in ranked[:top_n]:
+        ratio = mx / max(p999, 1e-9)
+        eff = 8 - math.log2(max(ratio, 1.0))
+        print(f"{name:<38}{mx:>11.2f}{p999:>11.2f}{ratio:>9.1f}{eff:>9.1f}")
+    print("-" * 78)
+
+    worst = ranked[0][1][0] / max(ranked[0][1][1], 1e-9)
+    median = sorted(v[0] / max(v[1], 1e-9) for v in stats.values())
+    median = median[len(median) // 2]
+    print(f"worst ratio {worst:.1f}x, median {median:.1f}x across "
+          f"{len(stats)} layers")
+    if worst > 16:
+        print("\n=> Per-tensor INT8 cannot work here. The scale is set by "
+              "outliers,\n   leaving typical activations only a few effective "
+              "bits. Clip the\n   scale with --input_calib_method histogram "
+              "--percentile 99.9")
+    print("=" * 78)
+    return stats
 
 
 @torch.no_grad()
@@ -412,6 +522,10 @@ def main():
     fp_ppl, fp_top1 = evaluate_lm(model, args, loader_test,
                                   num_batches=args.num_batches, tag="fp32")
 
+    # Measure the true activation distribution while everything is still FP.
+    if args.outlier_report:
+        report_activation_outliers(model, loader_test, device, layer_quant)
+
     # Re-enable before calibration. collect_stats() scopes them from here,
     # and it cannot do so on a quantizer left disabled: forward() returns at
     # line 329 before the _if_calib branch, so nothing would be collected.
@@ -424,11 +538,34 @@ def main():
     collect_stats(model, layers, loader_calib, args.gpu,
                   quant_mode='iw', num_batches=2)
 
-    print("\nComputing amax...")
+    print(f"\nComputing amax (method={args.amax_method}, "
+          f"percentile={args.percentile})...")
     # strict=False: some quantizers never see data (e.g. an excluded
     # lm_head), and a strict load would raise on their empty calibrators.
+    #
+    # method/percentile only take effect with --input_calib_method histogram.
+    # With 'max', quantize.py:282 routes MaxCalibrator to a bare
+    # load_calib_amax(strict=False) and both are silently ignored.
     compute_amax(model, args, quant_mode='iw', layers=layers,
-                 method="percentile", percentile=99.9999, strict=False)
+                 method=args.amax_method, percentile=args.percentile,
+                 strict=False)
+
+    # ── attribute the damage before measuring it ─────────────────────────
+    w_ppl = w_top1 = i_ppl = i_top1 = None
+    if args.quant_ablation:
+        print("\nAblation: weight quantization only (inputs left FP)...")
+        set_quantizers(model, layer_quant, inputs=False, weights=True)
+        w_ppl, w_top1 = evaluate_lm(model, args, loader_test,
+                                    num_batches=args.num_batches,
+                                    tag="int8-weight-only")
+
+        print("\nAblation: input quantization only (weights left FP)...")
+        set_quantizers(model, layer_quant, inputs=True, weights=False)
+        i_ppl, i_top1 = evaluate_lm(model, args, loader_test,
+                                    num_batches=args.num_batches,
+                                    tag="int8-input-only")
+
+        set_quantizers(model, layer_quant, inputs=True, weights=True)
 
     print("\nEvaluating input/weight-quantized model...")
     iw_ppl, iw_top1 = evaluate_lm(model, args, loader_test,
@@ -456,6 +593,9 @@ def main():
     print(f"{'stage':<24}{'perplexity':>16}{'top-1 %':>16}")
     print("-" * 62)
     print(f"{'FP32 baseline':<24}{fp_ppl:>16.3f}{fp_top1:>16.2f}")
+    if w_ppl is not None:
+        print(f"{'INT weight only':<24}{w_ppl:>16.3f}{w_top1:>16.2f}")
+        print(f"{'INT input only':<24}{i_ppl:>16.3f}{i_top1:>16.2f}")
     print(f"{'INT input+weight':<24}{iw_ppl:>16.3f}{iw_top1:>16.2f}")
     print(f"{'CIM (ADC + devices)':<24}{cim_ppl:>16.3f}{cim_top1:>16.2f}")
     print("=" * 62)
