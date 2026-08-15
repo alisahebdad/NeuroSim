@@ -29,6 +29,7 @@ import ast
 import time
 import argparse
 from datetime import datetime
+from subprocess import call
 
 import torch
 import torch.nn as nn
@@ -488,9 +489,80 @@ def main():
     # would describe a network that is not GPT-2.
     # =====================================================================
     if args.ppa:
-        raise NotImplementedError(
-            "C++ PPA estimation is not part of this Python-side port. "
-            "See the TODO block above for the prerequisites.")
+        run_ppa(args)
+
+
+def run_ppa(args):
+    """Invoke ./NeuroSIM/main over the 48 mapped projection layers.
+
+    Runs the estimator on exactly what NeuroSim can already express: the
+    static-weight matmuls. Everything else in GPT-2 (attention matmuls,
+    LayerNorm, GELU, softmax, embeddings, lm_head) is absent from both the
+    network description and the traces, so the numbers describe a PARTIAL
+    network. See the TODO block above.
+    """
+    net_csv = f'./NeuroSIM/NetWork_{MODEL_NAME}.csv'
+    trace_sh = f'./layer_record_{MODEL_NAME}/trace_command.sh'
+    binary = './NeuroSIM/main'
+
+    print("\n" + "=" * 62)
+    print("C++ HARDWARE ESTIMATION (partial network)")
+    print("=" * 62)
+
+    # ── pre-flight: the binary must exist ────────────────────────────────
+    if not os.path.isfile(binary):
+        raise FileNotFoundError(
+            f"{binary} not found. Build it first:\n"
+            f"    cd NeuroSIM && make -j\n"
+            f"and set novelMapping = false in NeuroSIM/Param.cpp:99 "
+            f"(transformers require conventional mapping).")
+
+    # ── pre-flight: rows and trace pairs must correspond ─────────────────
+    #
+    # main() associates network rows to trace files POSITIONALLY: the Nth
+    # row is assumed to describe the Nth weight/input pair on the command
+    # line. A count mismatch silently shifts every subsequent layer's
+    # association and produces plausible-looking but wrong numbers, so it is
+    # checked rather than trusted.
+    with open(net_csv) as f:
+        n_rows = sum(1 for line in f if line.strip())
+
+    with open(trace_sh) as f:
+        cmd = f.read()
+    n_weight = cmd.count('/weight_')
+    n_input = cmd.count('/input_')
+
+    print(f"  network rows      : {n_rows}  ({net_csv})")
+    print(f"  weight trace files: {n_weight}")
+    print(f"  input trace files : {n_input}")
+
+    if not (n_rows == n_weight == n_input):
+        raise RuntimeError(
+            f"Mismatch: {n_rows} network rows but {n_weight} weight / "
+            f"{n_input} input traces. ./NeuroSIM/main pairs them by "
+            f"position, so this would mis-associate layers. Traces are "
+            f"written on each layer's first forward (macro.py:25), so a "
+            f"shortfall usually means some layer never ran, or was excluded "
+            f"from quantization but still traced.")
+
+    print(f"\n  Mapped: 48 projection layers "
+          f"(4 per block x 12 blocks), 85M of GPT-2's 124M parameters.")
+    print(f"  NOT mapped: QK^T, softmax(.)V, LayerNorm, GELU, softmax, "
+          f"wte/wpe embeddings, lm_head.")
+    print("\nRunning estimator...\n")
+
+    rc = call(["/bin/bash", trace_sh])
+
+    print("\n" + "=" * 62)
+    if rc != 0:
+        print(f"Estimator exited with code {rc} -- output above is not valid.")
+    else:
+        print("Estimator finished.")
+        print("\nREAD THE NUMBERS AS PARTIAL. They describe a 48-layer "
+              "matmul-only network, not GPT-2. Any TOPS/W or area figure "
+              "quoted from this run must state that scope explicitly, and "
+              "must not be compared against a full-model accuracy number.")
+    print("=" * 62)
 
 
 if __name__ == '__main__':
