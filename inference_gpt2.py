@@ -395,9 +395,28 @@ def main():
             module._cim_args.hook = False
 
     # ── baseline (FP) ────────────────────────────────────────────────────
+    #
+    # Every TensorQuantizer must be explicitly disabled first. A quantizer
+    # whose _amax has never been registered does NOT pass its input through
+    # untouched -- tensor_quantizer.py:345 still runs _quant_forward(), which
+    # derives amax dynamically from the batch. Without this loop the row
+    # labelled "FP32" is really dynamic per-tensor INT8, which on GPT-2 is
+    # catastrophic (activation outliers) and makes the whole comparison
+    # meaningless. Cross-check against baseline_gpt2.py.
+    for m in model.modules():
+        if isinstance(m, quant_nn.TensorQuantizer):
+            m.disable()
+
     print("\nEvaluating FP baseline...")
     fp_ppl, fp_top1 = evaluate_lm(model, args, loader_test,
                                   num_batches=args.num_batches, tag="fp32")
+
+    # Re-enable before calibration. collect_stats() scopes them from here,
+    # and it cannot do so on a quantizer left disabled: forward() returns at
+    # line 329 before the _if_calib branch, so nothing would be collected.
+    for m in model.modules():
+        if isinstance(m, quant_nn.TensorQuantizer):
+            m.enable()
 
     # ── calibrate input/weight quantizers ────────────────────────────────
     print("\nCollecting activation statistics...")
