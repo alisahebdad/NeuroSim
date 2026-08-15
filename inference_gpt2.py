@@ -25,6 +25,7 @@ Usage:
 """
 
 import os
+import sys
 import ast
 import math
 import time
@@ -691,13 +692,46 @@ def run_ppa(args):
             f"shortfall usually means some layer never ran, or was excluded "
             f"from quantization but still traced.")
 
+    # ── pre-flight: conventional mapping must be enabled ─────────────────
+    #
+    # Transformers require it, there is no CLI flag, and leaving the default
+    # in place yields plausible but wrong numbers -- the worst failure mode
+    # available here, because nothing about the output looks wrong.
+    try:
+        with open('./NeuroSIM/Param.cpp') as f:
+            for n, line in enumerate(f, 1):
+                if 'novelMapping' in line and '=' in line and '//' not in \
+                        line.split('novelMapping')[0]:
+                    if 'true' in line.split('//')[0]:
+                        raise RuntimeError(
+                            f"NeuroSIM/Param.cpp:{n} still sets "
+                            f"novelMapping = true. Transformers require "
+                            f"conventional mapping; set it to false and "
+                            f"rebuild (cd NeuroSIM && make -j). Results "
+                            f"produced with novel mapping look plausible "
+                            f"but are wrong for this network.")
+                    break
+    except FileNotFoundError:
+        print("  WARNING: could not read NeuroSIM/Param.cpp to verify "
+              "novelMapping.")
+
     print(f"\n  Mapped: 48 projection layers "
           f"(4 per block x 12 blocks), 85M of GPT-2's 124M parameters.")
     print(f"  NOT mapped: QK^T, softmax(.)V, LayerNorm, GELU, softmax, "
           f"wte/wpe embeddings, lm_head.")
-    print("\nRunning estimator...\n")
 
+    # The estimator makes TWO silent passes over every layer with the
+    # upstream defaults (Param.cpp: synchronous = true, pipeline = true):
+    # a clock-calibration pass and the pipeline pass. Neither prints
+    # anything, so a 48-layer network appears to hang after "FloorPlan
+    # Done". Progress lines were added to main.cpp; see report.md 6.8.
+    print("\nRunning estimator. Two passes over 48 layers, each re-reading "
+          "the trace files -- expect several minutes.\n")
+    sys.stdout.flush()
+
+    t0 = time.time()
     rc = call(["/bin/bash", trace_sh])
+    print(f"\nEstimator wall time: {time.time() - t0:.1f} s")
 
     print("\n" + "=" * 62)
     if rc != 0:

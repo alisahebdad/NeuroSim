@@ -534,7 +534,45 @@ migration folding a per-channel scale into the preceding LayerNorm weight —
 free at inference, and it moves the difficulty into the weights, where
 per-column scaling *is* permitted.
 
-### 6.8 Reporting constraint
+### 6.8 C++ progress instrumentation — the first upstream source change
+
+**This ends the port's purely-additive property.** `NeuroSIM/main.cpp` is now
+modified. The change is cosmetic — two `cout` lines, no effect on any computed
+value — but the claim that no upstream source was touched no longer holds and
+must be corrected wherever it appears.
+
+**Symptom.** With `--ppa 1`, the estimator prints `FloorPlan Done` and then
+produces no output for a long time, appearing hung.
+
+**Cause.** Two upstream defaults each trigger a fully silent pass over every
+layer:
+
+| Setting | Default | Consequence |
+|---|---|---|
+| `Param.cpp:118` `synchronous` | `true` | A clock-calibration loop (`main.cpp:297`) runs `ChipCalculatePerformance` over all 48 layers and prints nothing until the final `clkPeriod:` line |
+| `Param.cpp:108` `pipeline` | `true` | The verbose per-layer loop at `main.cpp:318` sits inside `if (!param->pipeline)` and therefore never executes; control goes to the silent pipeline branch at line 384 |
+
+So with stock settings the estimator makes **two** complete passes over the
+network, and neither reports progress. On the shipped CNNs this is tolerable —
+VGG-8 has 8 layers and small traces. GPT-2 at T=1024 has 48 layers whose trace
+files run to hundreds of megabytes of CSV text, re-parsed on every pass.
+
+**Change.** One progress line added to each silent loop, marked
+`// GPT-2 port: progress`. Requires `make` to take effect.
+
+**Not changed:** `pipeline` and `synchronous` remain at their defaults.
+Setting `pipeline = false` would also produce per-layer output, using existing
+upstream code and no source change — but it selects a different hardware model
+(layer-by-layer rather than pipelined, with substantially different leakage
+energy), so it is a change of experiment, not of logging.
+
+**Related guard.** `run_ppa()` in `inference_gpt2.py` now reads `Param.cpp` and
+refuses to launch the estimator while `novelMapping = true`. That setting was
+still at its default as of this entry, and it is the most dangerous
+misconfiguration available here: it does not fail, it produces plausible
+numbers for the wrong mapping.
+
+### 6.9 Reporting constraint
 
 Accuracy covers the **whole** network; the hardware numbers the C++ side would
 eventually report cover only the 48 mapped projections. These two figures
@@ -558,3 +596,4 @@ describe different objects and must never be presented as one result.
 | 2026-08-11 | Ported the Python side of GPT-2 (§6): `dataset_gpt2.py`, `inference_gpt2.py`, TODO markers in `GPT2_Model.py`. Found and worked around a rank-3 geometry defect in `cim_linear.py:125` (§6.3). Not yet executed — no CUDA machine.                                          |
 | 2026-08-12 | Relaxed `requirements.txt` pins to floors after the pinned stack proved uninstallable on Python 3.14 (§1.5). Resolved a `datasets` / `huggingface_hub` `HfFolder` conflict. Confirmed the `pytorch_quantization` CUDA extension builds under Python 3.14 on the Linux host (§1.6).                |
 | 2026-08-15 | First end-to-end results (§6.5). Established FP32 reference 31.83 ppl / 38.00% top-1 via `baseline_gpt2.py`. Found and fixed a calibration defect (`MaxCalibrator` silently discards `percentile`), improving INT8 perplexity 56× from 7,106 to 126.75. Ablation attributes all remaining degradation to per-tensor activation quantization; weights are free (§6.6). Documented why per-channel activation scaling is not realizable on a crossbar (§6.7). |
+| 2026-08-15 | Added progress output to the two silent estimation loops in `NeuroSIM/main.cpp` — the first change to upstream source, so the port is no longer purely additive (§6.8). Added a `run_ppa()` guard that refuses to launch the estimator while `novelMapping = true`. Both Word reports now carry a stale "no upstream source modified" claim and must be regenerated. |

@@ -294,7 +294,11 @@ int main(int argc, char * argv[]) {
     
     if (param->synchronous){
         // calculate clkFreq
-        for (int i=0; i<netStructure.size(); i++) {     
+        cout << "Clock calibration pass over " << netStructure.size() << " layers..." << endl;
+        for (int i=0; i<netStructure.size(); i++) {
+            // GPT-2 port: progress. This pass is silent upstream, so a large
+            // network looks hung for minutes after "FloorPlan Done".
+            cout << "  [clk] layer " << i+1 << "/" << netStructure.size() << flush << endl;
             // Anni update: add &tileLeakageSRAMInUse
             ChipCalculatePerformance(inputParameter, tech, cell, i, argv[2*i+6], argv[2*i+6], argv[2*i+7], netStructure[i][6],
                         netStructure, markNM, numTileEachLayer, utilizationEachLayer, speedUpEachLayer, tileLocaEachLayer,
@@ -401,7 +405,10 @@ int main(int argc, char * argv[]) {
         vector<double> coreLatencyOtherPerLayer;
         vector<double> coreEnergyOtherPerLayer;
         
+        cout << "Pipeline estimation pass over " << netStructure.size() << " layers..." << endl;
         for (int i=0; i<netStructure.size(); i++) {
+            // GPT-2 port: progress. The pipeline branch is silent upstream.
+            cout << "  [pipe] layer " << i+1 << "/" << netStructure.size() << flush << endl;
             // Anni update: add &tileLeakageSRAMInUse
             ChipCalculatePerformance(inputParameter, tech, cell, i, argv[2*i+6], argv[2*i+6], argv[2*i+7], netStructure[i][6],
                         netStructure, markNM, numTileEachLayer, utilizationEachLayer, speedUpEachLayer, tileLocaEachLayer,
