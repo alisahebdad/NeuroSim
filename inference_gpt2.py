@@ -62,6 +62,12 @@ def parse_args():
                         'simulate_array() tractable.')
     p.add_argument('--batch_size', type=int, default=1)
     p.add_argument('--calib_batch_size', type=int, default=1)
+    p.add_argument('--calib_batches', type=int, default=2,
+                   help='batches used to build the calibration histogram. '
+                        'The default of 2 is ~2k tokens, which is thin for a '
+                        'percentile estimate -- the 99.9th percentile is then '
+                        'read off roughly the top 1500 values. Raise to 16-32 '
+                        'before trusting a percentile sweep.')
     p.add_argument('--calib_tokens', type=int, default=100_000,
                    help='truncate the calibration stream')
     p.add_argument('--num_batches', type=int, default=8,
@@ -536,7 +542,7 @@ def main():
     # ── calibrate input/weight quantizers ────────────────────────────────
     print("\nCollecting activation statistics...")
     collect_stats(model, layers, loader_calib, args.gpu,
-                  quant_mode='iw', num_batches=2)
+                  quant_mode='iw', num_batches=args.calib_batches)
 
     print(f"\nComputing amax (method={args.amax_method}, "
           f"percentile={args.percentile})...")

@@ -459,16 +459,91 @@ length:
 of attention leaves 97% of compute on CIM, which makes the exclusion
 defensible rather than evasive.
 
-### 6.5 Reporting constraint
+### 6.5 First results: the INT8 activation collapse
+
+Measured on WikiText-2 test, T=1024, 8,192 tokens, 8-bit weights and inputs,
+7-bit ADC, 1-bit cell, 128×128 subarray.
+
+| Stage | Perplexity | Top-1 % |
+|---|---|---|
+| FP32 baseline | 33.64 | 36.87 |
+| INT8 **weight only** | 33.64 | 36.88 |
+| INT8 **input only** | 120.84 | 23.90 |
+| INT8 input + weight | 126.75 | 23.47 |
+| CIM (ADC + devices) | 122.72 | 22.88 |
+
+Independently verified by `baseline_gpt2.py` (pure FP32, no quantization
+machinery): **31.83 perplexity, 38.00% top-1** over the full test split at
+T=1024, consistent with the published figure for GPT-2 small.
+
+**The ablation is decisive.** Per-output-channel 8-bit weight quantization is
+free — 33.642 against a 33.636 baseline, a 0.02% change. The entire
+degradation comes from **per-tensor 8-bit activation quantization**.
+
+**Calibration defect found.** The first run produced 7,106 perplexity (1.65%
+top-1, i.e. guessing). Cause: `--input_calib_method max` routes to
+`MaxCalibrator`, and `quantize.py:282` then calls a bare
+`load_calib_amax(strict=False)` — the `method` and `percentile` arguments are
+silently discarded. The scale was therefore pinned to the absolute maximum
+activation ever observed. Switching to `histogram` with `--percentile 99.9`
+improved perplexity **56×**, from 7,106 to 126.75.
+
+Note that the previously hardcoded percentile of 99.9999 would not have helped
+either: across ~1.5M calibration values it discards approximately one, so a
+single outlier still sets the scale.
+
+### 6.6 Activation outlier measurement
+
+Per-layer input statistics, FP32, one batch:
+
+| Layer | max | p99.9 | ratio | effective bits |
+|---|---|---|---|---|
+| `h.11.mlp.c_proj` | 33.86 | 2.93 | 11.6× | 4.5 |
+| `h.2.mlp.c_fc` | 19.80 | 1.78 | 11.1× | 4.5 |
+| `h.1.mlp.c_proj` | 12.26 | 1.55 | 7.9× | 5.0 |
+| `h.3.mlp.c_proj` | 10.71 | 1.49 | 7.2× | 5.2 |
+
+Worst ratio 11.6×, median 2.6× across the 48 mapped layers. A ratio of R
+leaves typical activations `8 − log₂(R)` effective bits, so the worst layers
+operate at roughly 4.5 bits despite an 8-bit budget.
+
+**The affected layers are exactly the MLP pair.** `mlp.c_proj` consumes GELU
+output and `mlp.c_fc` consumes LayerNorm output — the two distributions
+flagged as risks when the port was written. Attention projections are not
+among the worst offenders.
+
+### 6.7 Hardware realizability constrains the remedy
+
+The standard fix for activation outliers is per-channel scaling, but **a
+per-input-channel scale is not physically realizable on a crossbar**: it
+implies a distinct voltage scale per row, while the column integrates
+`Σ Vᵢ·Gᵢ` in the analog domain with no opportunity to undo per-row factors
+afterwards.
+
+| Scheme | Realizable? | Reason |
+|---|---|---|
+| Per-tensor input | ✅ | One scale per matmul, applied digitally after the ADC |
+| Per-token input | ✅ | One scale per input vector |
+| Per-input-channel input | ❌ | Per-row analog scale cannot be undone after summation |
+| Per-output-channel weight | ✅ | One scale per column, applied after the ADC |
+
+Remaining options are therefore percentile/MSE clipping, higher input
+precision (which costs DAC cycles directly, since
+`cycles_per_input = input_precision / dac_precision`), or a SmoothQuant-style
+migration folding a per-channel scale into the preceding LayerNorm weight —
+free at inference, and it moves the difficulty into the weights, where
+per-column scaling *is* permitted.
+
+### 6.8 Reporting constraint
 
 Accuracy covers the **whole** network; the hardware numbers the C++ side would
 eventually report cover only the 48 mapped projections. These two figures
 describe different objects and must never be presented as one result.
 
-> **Status: written, not executed.** No CUDA machine was available (§1.6). The
-> files parse, and the interfaces were checked against the upstream call
-> signatures, but no numbers have been produced and no claim here is
-> empirically verified.
+> **Status: executed.** Run on the Linux host (RTX-class GPU, CUDA 13.0,
+> Python 3.14) on 2026-08-15. The pipeline completes end to end at T=1024;
+> CIM evaluation costs ~12 s per 1024-token batch. C++ estimation
+> (`--ppa 1`) is implemented but not yet run.
 
 ---
 
@@ -482,3 +557,4 @@ describe different objects and must never be presented as one result.
 | 2026-08-11 | Converted `environment.yml` to `requirements.txt` for a `.venv` virtual environment (§1.5). Established that CUDA is a hard requirement of `pytorch-quantization`, not merely the fast path, and that the framework cannot run on macOS (§1.6).                            |
 | 2026-08-11 | Ported the Python side of GPT-2 (§6): `dataset_gpt2.py`, `inference_gpt2.py`, TODO markers in `GPT2_Model.py`. Found and worked around a rank-3 geometry defect in `cim_linear.py:125` (§6.3). Not yet executed — no CUDA machine.                                          |
 | 2026-08-12 | Relaxed `requirements.txt` pins to floors after the pinned stack proved uninstallable on Python 3.14 (§1.5). Resolved a `datasets` / `huggingface_hub` `HfFolder` conflict. Confirmed the `pytorch_quantization` CUDA extension builds under Python 3.14 on the Linux host (§1.6).                |
+| 2026-08-15 | First end-to-end results (§6.5). Established FP32 reference 31.83 ppl / 38.00% top-1 via `baseline_gpt2.py`. Found and fixed a calibration defect (`MaxCalibrator` silently discards `percentile`), improving INT8 perplexity 56× from 7,106 to 126.75. Ablation attributes all remaining degradation to per-tensor activation quantization; weights are free (§6.6). Documented why per-channel activation scaling is not realizable on a crossbar (§6.7). |
