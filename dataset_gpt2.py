@@ -23,7 +23,7 @@ def _encode_split(split, block_size, limit_tokens=None):
     from datasets import load_dataset
 
     print(f"Loading WikiText-2 [{split}] ...")
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
 
     # The raw dataset is one row per line; join into a single stream.
     text = "\n\n".join(ds["text"])
